@@ -4,14 +4,14 @@
 //! and [`crate::prompts`] respectively; this file just adapts them to the rmcp traits.
 
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
-    ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage, Role, ServerCapabilities,
-    ServerInfo, Tool,
+    CallToolRequestParam, CallToolResult, Content, ErrorData, GetPromptRequestParam,
+    GetPromptResult, Implementation, ListPromptsResult, ListToolsResult, PaginatedRequestParam,
+    Prompt, PromptMessage, PromptMessageContent, PromptMessageRole, ProtocolVersion,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 
@@ -37,34 +37,58 @@ impl Handler {
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
+        ServerInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .build(),
-        )
-        .with_server_info(Implementation::new("figma-mcp-rust", self.version.clone()))
-        .with_instructions(
-            "Figma MCP server with full read/write access through a companion Figma plugin. \
-             The plugin must be running in Figma Desktop (Plugins > Development > figma-mcp-rust) \
-             with its window open; until it connects, tool calls fail with 'plugin not connected'. \
-             Node IDs use colon format (e.g. 4029:12345). All write operations are undoable in Figma.",
-        )
+            server_info: Implementation {
+                name: "figma-mcp-rust".into(),
+                version: self.version.clone(),
+            },
+            instructions: Some(
+                "Figma MCP server with full read/write access through a companion Figma plugin. \
+                 The plugin must be running in Figma Desktop (Plugins > Development > figma-mcp-rust) \
+                 with its window open; until it connects, tool calls fail with 'plugin not connected'. \
+                 Node IDs use colon format (e.g. 4029:12345). All write operations are undoable in Figma."
+                    .into(),
+            ),
+        }
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tool_list().clone()))
+        let tools = tools::all()
+            .iter()
+            .map(|def| {
+                let schema = (def.input_schema)();
+                let input_schema = match schema {
+                    serde_json::Value::Object(m) => Arc::new(m),
+                    _ => Arc::new(serde_json::Map::new()),
+                };
+                Tool {
+                    name: Cow::Borrowed(def.name),
+                    description: Some(Cow::Borrowed(def.description)),
+                    input_schema,
+                    annotations: None,
+                }
+            })
+            .collect();
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        request: CallToolRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         let name = request.name.to_string();
         let def = match tools::find(&name) {
             Some(d) => d,
@@ -117,21 +141,28 @@ impl ServerHandler for Handler {
 
     async fn list_prompts(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         let prompts = prompts::all()
             .iter()
-            .map(|p| Prompt::new(p.name, Some(p.description), None))
+            .map(|p| Prompt {
+                name: p.name.to_string(),
+                description: Some(p.description.to_string()),
+                arguments: None,
+            })
             .collect();
-        Ok(ListPromptsResult::with_all_items(prompts))
+        Ok(ListPromptsResult {
+            prompts,
+            next_cursor: None,
+        })
     }
 
     async fn get_prompt(
         &self,
-        request: GetPromptRequestParams,
+        request: GetPromptRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResponse, ErrorData> {
+    ) -> Result<GetPromptResult, ErrorData> {
         let p = match prompts::find(&request.name) {
             Some(p) => p,
             None => {
@@ -141,11 +172,15 @@ impl ServerHandler for Handler {
                 ))
             }
         };
-        Ok(
-            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, p.body)])
-                .with_description(p.description)
-                .into(),
-        )
+        Ok(GetPromptResult {
+            description: Some(p.description.to_string()),
+            messages: vec![PromptMessage {
+                role: PromptMessageRole::User,
+                content: PromptMessageContent::Text {
+                    text: p.body.to_string(),
+                },
+            }],
+        })
     }
 
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
@@ -153,31 +188,16 @@ impl ServerHandler for Handler {
     }
 }
 
-/// The 73 schemas are built from `json!` literals, so build them once and hand
-/// out clones (name/description are borrowed, the schema is an `Arc`).
-fn tool_list() -> &'static Vec<Tool> {
-    static CACHE: OnceLock<Vec<Tool>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        tools::all()
-            .iter()
-            .map(|def| {
-                Tool::new(
-                    Cow::Borrowed(def.name),
-                    Cow::Borrowed(def.description),
-                    match (def.input_schema)() {
-                        serde_json::Value::Object(m) => Arc::new(m),
-                        _ => Arc::new(serde_json::Map::new()),
-                    },
-                )
-            })
-            .collect()
-    })
+fn text_result(text: String) -> CallToolResult {
+    CallToolResult {
+        content: vec![Content::text(text)],
+        is_error: Some(false),
+    }
 }
 
-fn text_result(text: String) -> CallToolResponse {
-    CallToolResult::success(vec![ContentBlock::text(text)]).into()
-}
-
-fn error_result(msg: &str) -> CallToolResponse {
-    CallToolResult::error(vec![ContentBlock::text(msg.to_string())]).into()
+fn error_result(msg: &str) -> CallToolResult {
+    CallToolResult {
+        content: vec![Content::text(msg.to_string())],
+        is_error: Some(true),
+    }
 }
